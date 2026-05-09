@@ -2,7 +2,6 @@
 import json
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
 from groq import Groq
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -12,27 +11,25 @@ import gc
 
 app = FastAPI()
 
-# ── Load everything at startup ──────────────────────────────
 print("Loading catalog...")
 with open("shl_catalog.json") as f:
     assessments = json.load(f)
-
-print("Loading embedding model...")
-# Use tiny model to fit in 512MB free RAM
-embed_model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
-
-print("Loading search index...")
-index = faiss.read_index("shl_index.faiss")
+    
+# Build simple text search index (no embedding model needed!)
+# We use keyword matching + Groq for intelligence
+print("Building keyword index...")
+assessment_texts = []
+for a in assessments:
+    text = f"{a['name']} {a['description']} {' '.join(a['test_types'])}".lower()
+    assessment_texts.append(text)
 
 print("Connecting to Groq...")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 client = Groq(api_key=GROQ_API_KEY)
 
-# Free up memory immediately
 gc.collect()
 print(f"Ready! {len(assessments)} assessments loaded.")
 
-# ── Request / Response models ───────────────────────────────
 class Message(BaseModel):
     role: str
     content: str
@@ -50,7 +47,6 @@ class ChatResponse(BaseModel):
     recommendations: List[Recommendation]
     end_of_conversation: bool
 
-# ── Prompts ─────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an SHL assessment recommender assistant. You help hiring managers and recruiters find the right SHL assessments for their hiring needs.
 
 STRICT RULES:
@@ -72,7 +68,7 @@ You must ALWAYS respond with valid JSON and NOTHING else - no text before or aft
 
 WHEN TO SET should_recommend TRUE:
 - You know job role + seniority level
-- You know job role + key skills
+- You know job role + key skills  
 - You know job role + any context
 - User says "junior/mid/senior [any role]"
 - User refines existing recommendations
@@ -86,7 +82,19 @@ REFUSING OFF-TOPIC:
 If asked anything not about SHL assessments, politely decline and ask what role they are hiring for.
 """
 
-# ── Helper functions ────────────────────────────────────────
+def keyword_search(query, top_k=10):
+    """Simple keyword search - no embedding model needed"""
+    query_words = query.lower().split()
+    scores = []
+    
+    for i, text in enumerate(assessment_texts):
+        score = sum(1 for word in query_words if word in text)
+        scores.append((score, i))
+    
+    scores.sort(reverse=True)
+    return [assessments[i] for score, i in scores[:top_k] if score > 0] or assessments[:top_k]
+
+
 def build_smart_query(messages):
     conversation = " ".join([m.content for m in messages])
     response = client.chat.completions.create(
@@ -95,7 +103,7 @@ def build_smart_query(messages):
             {
                 "role": "system",
                 "content": """Extract the key hiring requirements from this conversation and write a short search query.
-Include: job role, seniority, required skills, and any test types mentioned (like personality, ability, knowledge).
+Include: job role, seniority, required skills, and any test types mentioned.
 Return ONLY the search query, nothing else. Maximum 20 words."""
             },
             {"role": "user", "content": f"Conversation: {conversation}"}
@@ -108,26 +116,20 @@ Return ONLY the search query, nothing else. Maximum 20 words."""
 
 def get_catalog_context(messages, top_k=10):
     query = build_smart_query(messages)
-    query_embedding = embed_model.encode([query]).astype(np.float32)
-    distances, indices_found = index.search(query_embedding, top_k)
+    retrieved = keyword_search(query, top_k)
 
     context = "RELEVANT ASSESSMENTS FROM SHL CATALOG:\n\n"
-    retrieved = []
-
-    for idx in indices_found[0]:
-        a = assessments[idx]
+    for a in retrieved:
         context += f"Name: {a['name']}\n"
         context += f"URL: {a['url']}\n"
         context += f"Test Types: {a['test_types']}\n"
         context += f"Remote Testing: {a['remote_testing']}\n"
         context += f"Description: {a['description'][:200]}\n"
         context += "-" * 40 + "\n"
-        retrieved.append(a)
 
     return context, retrieved, query
 
 
-# ── Endpoints ───────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -136,21 +138,11 @@ def health():
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     messages = request.messages
-
     catalog_context, retrieved, smart_query = get_catalog_context(messages)
 
-    llm_messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT + "\n\n" + catalog_context
-        }
-    ]
-
+    llm_messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + catalog_context}]
     for msg in messages:
-        llm_messages.append({
-            "role": msg.role,
-            "content": msg.content
-        })
+        llm_messages.append({"role": msg.role, "content": msg.content})
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -183,10 +175,8 @@ def chat(request: ChatRequest):
 
     recommendations = []
     if should_recommend:
-        query_embedding = embed_model.encode([smart_query]).astype(np.float32)
-        distances, indices_found = index.search(query_embedding, 10)
-        for idx in indices_found[0]:
-            a = assessments[idx]
+        results = keyword_search(smart_query, 10)
+        for a in results:
             recommendations.append(Recommendation(
                 name=a["name"],
                 url=a["url"],
