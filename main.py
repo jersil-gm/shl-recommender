@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
 import os
+import gc
 
 app = FastAPI()
 
@@ -17,7 +18,8 @@ with open("shl_catalog.json") as f:
     assessments = json.load(f)
 
 print("Loading embedding model...")
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+# Use tiny model to fit in 512MB free RAM
+embed_model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
 
 print("Loading search index...")
 index = faiss.read_index("shl_index.faiss")
@@ -26,6 +28,8 @@ print("Connecting to Groq...")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 client = Groq(api_key=GROQ_API_KEY)
 
+# Free up memory immediately
+gc.collect()
 print(f"Ready! {len(assessments)} assessments loaded.")
 
 # ── Request / Response models ───────────────────────────────
@@ -54,12 +58,12 @@ STRICT RULES:
 2. Never recommend if you have NO job role at all
 3. Ask ONE clarifying question at a time maximum
 4. IMPORTANT: If you know the job role + ANY one detail (seniority OR skills OR context), set should_recommend to TRUE immediately
-5. Never make up assessment names or URLs — only use what is provided
+5. Never make up assessment names or URLs - only use what is provided
 6. If asked to compare assessments, use only the descriptions provided
 7. If user refines or adds requirements mid-conversation, update recommendations immediately
 
 RESPONSE FORMAT:
-You must ALWAYS respond with valid JSON and NOTHING else — no text before or after:
+You must ALWAYS respond with valid JSON and NOTHING else - no text before or after:
 {
   "reply": "your conversational response here",
   "should_recommend": true or false,
@@ -75,8 +79,8 @@ WHEN TO SET should_recommend TRUE:
 - User asks to add or remove a test type
 
 WHEN TO SET should_recommend FALSE:
-- No job role mentioned at all — ask what role
-- Only a job role with zero other details — ask one follow-up
+- No job role mentioned at all - ask what role
+- Only a job role with zero other details - ask one follow-up
 
 REFUSING OFF-TOPIC:
 If asked anything not about SHL assessments, politely decline and ask what role they are hiring for.
@@ -106,10 +110,10 @@ def get_catalog_context(messages, top_k=10):
     query = build_smart_query(messages)
     query_embedding = embed_model.encode([query]).astype(np.float32)
     distances, indices_found = index.search(query_embedding, top_k)
-    
+
     context = "RELEVANT ASSESSMENTS FROM SHL CATALOG:\n\n"
     retrieved = []
-    
+
     for idx in indices_found[0]:
         a = assessments[idx]
         context += f"Name: {a['name']}\n"
@@ -119,7 +123,7 @@ def get_catalog_context(messages, top_k=10):
         context += f"Description: {a['description'][:200]}\n"
         context += "-" * 40 + "\n"
         retrieved.append(a)
-    
+
     return context, retrieved, query
 
 
@@ -132,42 +136,41 @@ def health():
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     messages = request.messages
-    
+
     catalog_context, retrieved, smart_query = get_catalog_context(messages)
-    
+
     llm_messages = [
         {
             "role": "system",
             "content": SYSTEM_PROMPT + "\n\n" + catalog_context
         }
     ]
-    
+
     for msg in messages:
         llm_messages.append({
             "role": msg.role,
             "content": msg.content
         })
-    
+
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=llm_messages,
         temperature=0.3,
         max_tokens=1000
     )
-    
+
     raw = response.choices[0].message.content.strip()
-    
-    # Clean JSON
+
     if "```json" in raw:
         raw = raw.split("```json")[1].split("```")[0].strip()
     elif "```" in raw:
         raw = raw.split("```")[1].split("```")[0].strip()
-    
+
     start = raw.find("{")
     end = raw.rfind("}") + 1
     if start != -1 and end != 0:
         raw = raw[start:end]
-    
+
     try:
         parsed = json.loads(raw)
         reply = parsed.get("reply", "I am sorry, could you repeat that?")
@@ -177,8 +180,7 @@ def chat(request: ChatRequest):
         reply = raw
         should_recommend = False
         end_of_conversation = False
-    
-    # Build recommendations
+
     recommendations = []
     if should_recommend:
         query_embedding = embed_model.encode([smart_query]).astype(np.float32)
@@ -190,7 +192,7 @@ def chat(request: ChatRequest):
                 url=a["url"],
                 test_type=",".join(a["test_types"])
             ))
-    
+
     return ChatResponse(
         reply=reply,
         recommendations=recommendations,
